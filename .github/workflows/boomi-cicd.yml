@@ -66,6 +66,11 @@ jobs:
             exit 1
           fi
 
+          if ! jq -e . deploy/deployment-manifest.json >/dev/null 2>&1; then
+            echo "ERROR: deployment-manifest.json is not valid JSON."
+            exit 1
+          fi
+
           RELEASE="$(jq -r '.release // empty' deploy/deployment-manifest.json)"
           PROCESS_NAME="$(jq -r '.process // empty' deploy/deployment-manifest.json)"
           DESCRIPTION="$(jq -r '.description // empty' deploy/deployment-manifest.json)"
@@ -75,10 +80,8 @@ jobs:
             exit 1
           fi
 
-          if [[ "${PROCESS_NAME}" != "CICD_Demo_Process" ]]; then
-            echo "ERROR: Wrong process name."
-            echo "Expected: CICD_Demo_Process"
-            echo "Actual  : ${PROCESS_NAME}"
+          if [[ -z "${PROCESS_NAME}" ]]; then
+            echo "ERROR: process is missing."
             exit 1
           fi
 
@@ -128,21 +131,26 @@ jobs:
           COMPONENT_TYPE="$(jq -r '.type // empty' component_response.json)"
           COMPONENT_REVISION="$(jq -r '.version // empty' component_response.json)"
 
-          echo "Component Name     : ${COMPONENT_NAME}"
+          echo "Manifest Process   : ${PROCESS_NAME}"
+          echo "Boomi Component    : ${COMPONENT_NAME}"
           echo "Component Type     : ${COMPONENT_TYPE}"
           echo "Component Revision : ${COMPONENT_REVISION}"
 
-          if [[ "${COMPONENT_NAME}" != "CICD_Demo_Process" ]]; then
-            echo "ERROR: Component ID belongs to another component."
+          if [[ "${COMPONENT_NAME}" != "${PROCESS_NAME}" ]]; then
+            echo "ERROR: BOOMI_COMPONENT_ID belongs to a different process."
+            echo "Manifest process : ${PROCESS_NAME}"
+            echo "Boomi process    : ${COMPONENT_NAME}"
             exit 1
           fi
 
           if [[ "${COMPONENT_TYPE}" != "process" ]]; then
-            echo "ERROR: Component is not a process."
+            echo "ERROR: Component is not a Boomi process."
             exit 1
           fi
 
           echo "BOOMI_REVISION=${COMPONENT_REVISION}" >> "${GITHUB_ENV}"
+
+          echo "Boomi process verification successful."
 
       - name: Create Boomi Packaged Component
         shell: bash
@@ -158,7 +166,7 @@ jobs:
           jq -n \
             --arg componentId "${BOOMI_COMPONENT_ID}" \
             --arg packageVersion "${PACKAGE_VERSION}" \
-            --arg notes "GitHub Actions Release ${RELEASE}. Run ${GITHUB_RUN_ID}." \
+            --arg notes "GitHub Actions automatic package for ${PROCESS_NAME}. Release ${RELEASE}. Run ${GITHUB_RUN_ID}." \
             '{
               componentId: $componentId,
               packageVersion: $packageVersion,
@@ -199,6 +207,7 @@ jobs:
           echo "PACKAGED_COMPONENT_REVISION=${PACKAGED_COMPONENT_REVISION}" >> "${GITHUB_ENV}"
 
           echo "Package created successfully."
+          echo "Process            : ${PROCESS_NAME}"
           echo "Package ID         : ${PACKAGE_ID}"
           echo "Package Version    : ${CREATED_PACKAGE_VERSION}"
           echo "Component Revision : ${PACKAGED_COMPONENT_REVISION}"
@@ -217,7 +226,7 @@ jobs:
           jq -n \
             --arg environmentId "${BOOMI_ENVIRONMENT_ID}" \
             --arg packageId "${PACKAGE_ID}" \
-            --arg notes "GitHub Actions Test deployment. Release ${RELEASE}." \
+            --arg notes "GitHub Actions automatic deployment for ${PROCESS_NAME}. Release ${RELEASE}." \
             '{
               environmentId: $environmentId,
               packageId: $packageId,
@@ -273,8 +282,9 @@ jobs:
           echo "DEPLOYMENT_ID=${DEPLOYMENT_ID}" >> "${GITHUB_ENV}"
 
           echo "Deployment completed successfully."
-          echo "Deployment ID : ${DEPLOYMENT_ID}"
-          echo "Active        : ${DEPLOYMENT_ACTIVE}"
+          echo "Process       : ${PROCESS_NAME}"
+          echo "Deployment ID: ${DEPLOYMENT_ID}"
+          echo "Active       : ${DEPLOYMENT_ACTIVE}"
 
       - name: Verify Active Boomi Deployment
         shell: bash
@@ -347,7 +357,7 @@ jobs:
           set -euo pipefail
 
           echo "=========================================="
-          echo "STEP 7 - Execute CICD_Demo_Process"
+          echo "STEP 7 - Execute ${PROCESS_NAME}"
           echo "=========================================="
 
           AUTH_USER="BOOMI_TOKEN.${BOOMI_USERNAME}"
@@ -367,26 +377,49 @@ jobs:
               }
             }' > execution_request.json
 
-          HTTP_CODE="$(
-            curl -sS \
-              -o execution_response.json \
-              -w "%{http_code}" \
-              -u "${AUTH_USER}:${BOOMI_API_TOKEN}" \
-              -H "Accept: application/json" \
-              -H "Content-Type: application/json" \
-              -X POST \
-              "${API_ROOT}/ExecutionRequest" \
-              --data @execution_request.json
-          )"
+          EXECUTION_SUBMITTED="false"
 
-          echo "ExecutionRequest HTTP Status: ${HTTP_CODE}"
+          for ATTEMPT in $(seq 1 8); do
 
-          jq . execution_response.json || cat execution_response.json
+            echo "Execution request attempt ${ATTEMPT}/8"
 
-          if (( HTTP_CODE < 200 || HTTP_CODE >= 300 )); then
-            echo "ERROR: ExecutionRequest failed."
+            HTTP_CODE="$(
+              curl -sS \
+                -o execution_response.json \
+                -w "%{http_code}" \
+                -u "${AUTH_USER}:${BOOMI_API_TOKEN}" \
+                -H "Accept: application/json" \
+                -H "Content-Type: application/json" \
+                -X POST \
+                "${API_ROOT}/ExecutionRequest" \
+                --data @execution_request.json
+            )"
+
+            echo "ExecutionRequest HTTP Status: ${HTTP_CODE}"
+
+            if (( HTTP_CODE >= 200 && HTTP_CODE < 300 )); then
+              EXECUTION_SUBMITTED="true"
+              break
+            fi
+
+            if [[ "${HTTP_CODE}" == "401" || "${HTTP_CODE}" == "403" ]]; then
+              echo "ERROR: Authentication or Execute privilege failure."
+              cat execution_response.json || true
+              exit 1
+            fi
+
+            echo "Deployment may still be propagating."
+            cat execution_response.json || true
+            echo "Waiting 15 seconds..."
+            sleep 15
+          done
+
+          if [[ "${EXECUTION_SUBMITTED}" != "true" ]]; then
+            echo "ERROR: ExecutionRequest failed after all retries."
             exit 1
           fi
+
+          jq . execution_response.json || cat execution_response.json
 
           REQUEST_ID="$(jq -r '.requestId // empty' execution_response.json)"
 
@@ -398,6 +431,7 @@ jobs:
           echo "REQUEST_ID=${REQUEST_ID}" >> "${GITHUB_ENV}"
 
           echo "Execution request submitted."
+          echo "Process   : ${PROCESS_NAME}"
           echo "Request ID: ${REQUEST_ID}"
 
       - name: Wait for Boomi Execution Result
@@ -446,24 +480,6 @@ jobs:
 
             echo "Boomi response:"
             jq . execution_record_response.json
-
-            #
-            # IMPORTANT:
-            # Your Boomi account returns:
-            #
-            # {
-            #   "@type": "AsyncOperationResult",
-            #   "result": [
-            #     {
-            #       "@type": "ExecutionRecord",
-            #       ...
-            #     }
-            #   ]
-            # }
-            #
-            # The expressions below intentionally read result[0].
-            # They also support a direct ExecutionRecord response.
-            #
 
             STATUS="$(
               jq -r '
@@ -517,7 +533,7 @@ jobs:
             echo "=========================================="
 
             if [[ -z "${STATUS}" ]]; then
-              echo "ExecutionRecord has no status yet."
+              echo "Execution status not available yet."
               sleep 10
               continue
             fi
@@ -542,8 +558,10 @@ jobs:
               exit 1
             fi
 
-            if [[ "${RETURNED_PROCESS_NAME}" != "CICD_Demo_Process" ]]; then
-              echo "ERROR: Process name does not match."
+            if [[ "${RETURNED_PROCESS_NAME}" != "${PROCESS_NAME}" ]]; then
+              echo "ERROR: Execution process name does not match manifest."
+              echo "Expected : ${PROCESS_NAME}"
+              echo "Actual   : ${RETURNED_PROCESS_NAME}"
               exit 1
             fi
 
