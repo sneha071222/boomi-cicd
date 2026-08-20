@@ -1,5 +1,5 @@
 {
   "release": "1.0.0",
-  "process": "CICD_Demo_Process",
+  "process": "task 1",
   "description": "CI/CD Demo Version 2"
 }
